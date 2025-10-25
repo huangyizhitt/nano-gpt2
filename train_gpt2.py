@@ -34,7 +34,7 @@ class DataLoaderLite:
         self.current_position += B * T
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T + 1)  > len(self.tokens):
-            set.current_position = 0
+            self.current_position = 0
         return x, y
 
 @dataclass
@@ -54,6 +54,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # 这里的3是为了让输入进过这个线性层以后直接获得Q、K、V的组合矩阵，方便计算
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -89,6 +90,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -124,6 +126,28 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False)
+
+        # weight sharing scheme
+        # 把wte这层和lm_head这层的权重进行绑定（tie weight），指向同一个权重矩阵
+        # GPT2参考transformer论文中的做法，确保输入输出词元的embedding具有相似性
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        # 遍历每个模块，对它们的weight进行初始化，apply方法由nn.Module提供
+        self.apply(self._init_weights)
+
+    # GPT2/3的文章中没显示说明，这是看代码时发现的
+    def _init_weights(self, module):
+        std = 0.02
+        if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            # 残差网络会被给一个缩放因子，参考GPT-2的论文
+            std *= (2 * self.config.n_layer) ** -0.5
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -207,6 +231,8 @@ class GPT(nn.Module):
 
         return model
 
+import time
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -214,19 +240,44 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-train_loader = DataLoaderLite(B=4, T=32)
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=8, T=1024)
+
+# highest: float32 = float32 * float32, high: float32 = tf32 * tf32, medium: float32 = bf16 * bf16 
+torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig())
 model.to(device)
 
+# 1. torch.compile会查看整个模型代码，并将python解释器从中移除，转换成抽象的计算图
+# 2. 分离出forward和backward计算，提前构建反向传播图，并做算子级别优化（如常量折叠、子图融合）。
+# 3. 代码生成与编译执行，会把优化后的计算图翻译成更底层的高性能代码
+model = torch.compile(model)
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
-    optimizer.zero_grad()
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y= x.to(device), y.to(device)
-    logits, loss = model(x, y)
+    optimizer.zero_grad()
+
+    # 混合精度计算
+    # 注意FP16 高精度（10位尾数）、低动态范围（5位指数），容易溢出，BF16是低精度（7位尾数），高动态范围（8位指数，与FP32一样）
+    # 因此，BF16在表示范围上与FP32一致，而如果使用FP16训练，差了很多表示范围，就要进行梯度缩放，保证在表示范围内
+    # 也不是所有的操作能被autocast成bf16, softmax、layernorm、log softmax等都不会。
+    # 矩阵乘法对精度变化有更多鲁棒性，因此，更多矩阵乘法能够autocast成bf16.
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+#        import code; code.interact(local=locals())
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000   # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
