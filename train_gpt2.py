@@ -3,13 +3,17 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 import tiktoken
 
+# 采用不放回采样
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -21,7 +25,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -31,10 +35,10 @@ class DataLoaderLite:
         y = (buf[1:].view(B, T)) # target
 
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1)  > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1)  > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 @dataclass
@@ -74,10 +78,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # attention (meterialize)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # F.scaled_dot_product_attention将调用flash-attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal = True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by
         # output projection
         y = self.c_proj(y)
@@ -135,6 +143,36 @@ class GPT(nn.Module):
         # init params
         # 遍历每个模块，对它们的weight进行初始化，apply方法由nn.Module提供
         self.apply(self._init_weights)
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # Crate AdamW optimizer and use the fused version if it is availabe
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
 
     # GPT2/3的文章中没显示说明，这是看代码时发现的
     def _init_weights(self, module):
@@ -232,52 +270,159 @@ class GPT(nn.Module):
         return model
 
 import time
+import os
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+
+ddp_rank=0
+ddp_local_rank=0
+ddp_world_size=0
+
+# 多进程执行torchrun --standalone --nproc_per_node=4 train_gpt2.py
+
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA or DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=8, T=1024)
+total_batch_size = 524288   # 2**19, ~.5M, in number of tokens
+B = 8       # micro batch size
+T = 1024    # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 # highest: float32 = float32 * float32, high: float32 = tf32 * tf32, medium: float32 = bf16 * bf16 
 torch.set_float32_matmul_precision("high")
 
-model = GPT(GPTConfig())
+# 50304能被128整除，通过添加不存在词元的空间来确保矩阵维度
+# 尽管会增加计算量和内存消耗，但是可以适应更好的CUDA内核，运行得更快
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+
+# betas和eps可以在GPT3的文章中找到
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+
+# GPT-3文章指出，模型权重使用0.1作为weight_decay
+optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, betas = (0.9, 0.95), device_type=device)
 
 # 1. torch.compile会查看整个模型代码，并将python解释器从中移除，转换成抽象的计算图
 # 2. 分离出forward和backward计算，提前构建反向传播图，并做算子级别优化（如常量折叠、子图融合）。
 # 3. 代码生成与编译执行，会把优化后的计算图翻译成更底层的高性能代码
 model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+# 把模型装载到DDP容器中，在反向传播后，DDP会收集所有rank的梯度，然后进行平均，并存在每个rank上
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+# GPT-3 small setting
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps=50
+
+def get_lr(it):
+    # 1. linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    
+    # 2. if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    
+    # 3. in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps) # decay_ratio starts at 0 and goes to 1
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y= x.to(device), y.to(device)
     optimizer.zero_grad()
 
-    # 混合精度计算
-    # 注意FP16 高精度（10位尾数）、低动态范围（5位指数），容易溢出，BF16是低精度（7位尾数），高动态范围（8位指数，与FP32一样）
-    # 因此，BF16在表示范围上与FP32一致，而如果使用FP16训练，差了很多表示范围，就要进行梯度缩放，保证在表示范围内
-    # 也不是所有的操作能被autocast成bf16, softmax、layernorm、log softmax等都不会。
-    # 矩阵乘法对精度变化有更多鲁棒性，因此，更多矩阵乘法能够autocast成bf16.
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-#        import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0.0
+
+    # 当显存容量不足，难以支持大批次训练时，如GPT的batch size设置为0.5M
+    # 就可以采用串行执行grad_accum_steps个小批次，梯度累积的方式进行模拟
+    # grad_accum_steps * B * T == batch size
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y= x.to(device), y.to(device)
+        
+
+        # 混合精度计算
+        # 注意FP16 高精度（10位尾数）、低动态范围（5位指数），容易溢出，BF16是低精度（7位尾数），高动态范围（8位指数，与FP32一样）
+        # 因此，BF16在表示范围上与FP32一致，而如果使用FP16训练，差了很多表示范围，就要进行梯度缩放，保证在表示范围内
+        # 也不是所有的操作能被autocast成bf16, softmax、layernorm、log softmax等都不会。
+        # 矩阵乘法对精度变化有更多鲁棒性，因此，更多矩阵乘法能够autocast成bf16.
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+            
+        # 需要注意，串行小批次之后，均方误差、交叉熵误差这类带均值的计算公式，存在系数丢失的问题。
+        # 比如4步分为4个1步，原本系数为1/4，现在变成了1
+        loss = loss / grad_accum_steps
+
+        # 用于打印每一步的loss
+        loss_accum += loss.detach()
+        # import code; code.interact(local=locals())
+
+        if ddp:
+            # model.require_backward_grad_sync为True时，会使loss.backward()触发RANK之间的梯度同步
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps-1)
+        loss.backward()
+
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
+    # we clip the global norm of the gradient at 1.0
+    # 如果梯度的整体范数太大，就把它按比例缩小到一个安全范围。GPT3论文把梯度的范数缩小到了1.0，防止梯度爆炸。
+    # 梯度的整体范数是一个很有用的信息，如果一直攀升，出现尖峰，就不是一个好信号。
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    lr = get_lr(step)
+    # 优化器中可能有多个参数组
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000   # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / (t1 - t0)
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
